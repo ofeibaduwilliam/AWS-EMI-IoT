@@ -18,7 +18,7 @@ AWS MQTT Test Client and validated against a reference instrument.
 
 | Name | Index number |
 |---|---|
-| William `[fill in your index number]` | `[fill in]` |
+| William Ofei-Badu | 4104724 |
 | Nana Yaw Asumadu Ntiamoah | 4092624 |
 | Jude Allotey Adotei | 4088924 |
 
@@ -68,7 +68,7 @@ telemetry_station/
 └── README.md               This file
 ```
 
-`secrets.h` must be listed in `.gitignore`.
+`secrets.h` listed in `.gitignore`.
 
 ---
 
