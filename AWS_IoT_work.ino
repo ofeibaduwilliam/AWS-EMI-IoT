@@ -1,109 +1,135 @@
 /*
  * Basic Temperature & Humidity Telemetry Station
- * Layer 1: WiFi + DHT11 -> calibrated JSON to serial
+ * Layer 2: DHT11 -> calibrated JSON -> AWS IoT Core over MQTT/TLS
  *
  * Board: ESP32   Sensor: DHT11 on GPIO4
- * Cloud layer (AWS IoT Core over MQTT/TLS) is added next.
- *
- * Secrets (WiFi creds, later device certs) live in secrets.h, which is
- * kept OUT of version control. See secrets.h in this folder.
+ * Secrets (WiFi creds, endpoint, Thing name, certs) live in secrets.h.
+ * 
  */
-
-#include <WiFi.h>
+ 
+#include "secrets.h"
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 #include <DHT.h>
 #include <time.h>
-#include "secrets.h"          // defines WIFI_SSID, WIFI_PASSWORD
+#include <WiFi.h>
+
+// Publish topic must match the least-privilege IoT policy:
+//   esp32/<THINGNAME>/telemetry
+// String-literal concatenation, so THINGNAME must be a #define in secrets.h.
+#define PUB_TOPIC ("esp32/" THINGNAME "/telemetry")
 
 // ---------- Sensor ----------
-#define DHT_PIN   4           // DATA line -> GPIO4
+#define DHT_PIN   4
 #define DHT_TYPE  DHT11
 DHT dht(DHT_PIN, DHT_TYPE);
 
-// ---------- Calibration:  calibrated = raw * gain + offset ----------
-// Identity for now. Tune AFTER comparing to your reference thermometer.
+// ---------- Calibration: calibrated = raw * gain + offset ----------
+// Identity until you calibrate against your reference thermometer.
 const float TEMP_GAIN   = 1.0;
 const float TEMP_OFFSET = 0.0;
 const float HUM_GAIN    = 1.0;
 const float HUM_OFFSET  = 0.0;
 
 // ---------- Timing ----------
-const unsigned long PUBLISH_INTERVAL_MS = 5000;   // 5 s
+const unsigned long PUBLISH_INTERVAL_MS = 10000;   // 10 s
+
+WiFiClientSecure net;
+PubSubClient client(net);
 unsigned long lastPublish = 0;
 
-// ---------- Identity ----------
-char deviceId[24];            // derived from the ESP32 MAC, stable per board
-
-void makeDeviceId() {
-  uint64_t mac = ESP.getEfuseMac();
-  snprintf(deviceId, sizeof(deviceId), "esp32-%012llx", (unsigned long long)mac);
-}
-
-void connectWiFi() {
-  Serial.printf("Connecting to %s", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.printf("\nConnected. IP: %s  RSSI: %d dBm\n",
-                WiFi.localIP().toString().c_str(), WiFi.RSSI());
-}
-
-// Sync clock from NTP so payloads carry a real epoch timestamp (UTC).
-// Bounded wait; if it fails we flag it rather than block forever.
+// NTP sync. REQUIRED before the TLS handshake: the ESP32 boots with its clock
+// at 1970, so TLS rejects the AWS certificate as "not yet valid" and the
+// connection silently fails. Also supplies the real epoch timestamp.
 bool syncTime() {
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");   // UTC, no offset
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");   // UTC
   Serial.print("Syncing time");
-  for (int i = 0; i < 20; i++) {                        // up to ~10 s
-    if (time(nullptr) > 1700000000) {                   // clearly past epoch
+  for (int i = 0; i < 20; i++) {
+    if (time(nullptr) > 1700000000) {
       Serial.printf("\nTime synced: %ld\n", (long)time(nullptr));
       return true;
     }
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWARNING: NTP sync failed, timestamps will be 0");
+  Serial.println("\nWARNING: NTP sync failed; TLS may reject the certificate.");
   return false;
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  makeDeviceId();
-  Serial.printf("Device ID: %s\n", deviceId);
-  dht.begin();
-  connectWiFi();
-  syncTime();
+void connectAWS() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("Connecting to Wi-Fi SSID: [%s]", WIFI_SSID);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.printf(" [status=%d]", WiFi.status());
+    if (++tries > 20) {   // ~10 s, then report and keep trying
+      Serial.println("\nWi-Fi not connecting. 1=SSID not found, 4=wrong password, 6=disconnected.");
+      tries = 0;
+    }
+  }
+  Serial.println(" connected.");
+
+  syncTime();                       // must run before the TLS connect below
+
+  net.setCACert(AWS_ROOT_CA);
+  net.setCertificate(DEVICE_CERT);
+  net.setPrivateKey(PRIVATE_KEY);
+
+  client.setServer(AWS_IOT_ENDPOINT, 8883);
+  client.setBufferSize(512);        // headroom so the JSON packet isn't dropped
+
+  Serial.print("Connecting to AWS IoT Core");
+  while (!client.connect(THINGNAME)) {   // client ID == Thing name (policy needs this)
+    Serial.print(".");
+    delay(1000);
+  }
+  Serial.println(" connected.");
 }
 
-void loop() {
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
-
-  unsigned long now = millis();
-  if (now - lastPublish < PUBLISH_INTERVAL_MS) return;
-  lastPublish = now;
-
+void publishReading() {
   float rawT = dht.readTemperature();   // degrees Celsius
   float rawH = dht.readHumidity();      // % relative humidity
 
   if (isnan(rawT) || isnan(rawH)) {
-    Serial.println("{\"error\":\"DHT read failed\"}");
+    Serial.println("DHT read failed; skipping this cycle.");
     return;
   }
 
   float tempC    = rawT * TEMP_GAIN + TEMP_OFFSET;
   float humidity = rawH * HUM_GAIN  + HUM_OFFSET;
-  long  ts       = (long)time(nullptr);   // epoch seconds, UTC
 
-  // Same JSON shape we'll publish to AWS IoT Core: device ID, epoch
-  // timestamp, values with explicit units.
-  char payload[200];
-  snprintf(payload, sizeof(payload),
-    "{\"device_id\":\"%s\",\"timestamp\":%ld,"
-    "\"temperature\":%.1f,\"temperature_unit\":\"C\","
-    "\"humidity\":%.1f,\"humidity_unit\":\"%%\"}",
-    deviceId, ts, tempC, humidity);
+  StaticJsonDocument<200> doc;
+  doc["device_id"]        = THINGNAME;
+  doc["timestamp"]        = (long)time(nullptr);   // UTC epoch seconds
+  doc["temperature"]      = tempC;
+  doc["temperature_unit"] = "C";
+  doc["humidity"]         = humidity;
+  doc["humidity_unit"]    = "%";
 
-  Serial.println(payload);
+  char buffer[256];
+  serializeJson(doc, buffer);
+  client.publish(PUB_TOPIC, buffer);
+  Serial.println(buffer);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  dht.begin();
+  connectAWS();
+}
+
+void loop() {
+  if (!client.connected()) {
+    connectAWS();
+  }
+  client.loop();
+
+  if (millis() - lastPublish > PUBLISH_INTERVAL_MS) {
+    lastPublish = millis();
+    publishReading();
+  }
 }
